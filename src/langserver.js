@@ -107,6 +107,8 @@ const MAX_LS_INSTANCES = (() => {
   return Number.isFinite(n) && n > 0 ? n : estimateDefaultMaxLsInstances(detectMemoryLimitBytes());
 })();
 const LS_POOL_WAIT_MS = positiveIntEnv('LS_POOL_WAIT_MS', 30_000, 0);
+const LS_STARTUP_TIMEOUT_MS = positiveIntEnv('LS_STARTUP_TIMEOUT_MS', 90_000, 5_000);
+const LS_READY_TIMEOUT_MS = positiveIntEnv('LS_READY_TIMEOUT_MS', LS_STARTUP_TIMEOUT_MS, 5_000);
 const LS_MEMORY_GUARD_ENABLED = process.env.LS_MEMORY_GUARD !== '0';
 const LS_SPAWN_MIN_AVAILABLE_BYTES_RAW = String(process.env.LS_SPAWN_MIN_AVAILABLE_BYTES || '').trim();
 const LS_SPAWN_MIN_AVAILABLE_BYTES_EXPLICIT = !!LS_SPAWN_MIN_AVAILABLE_BYTES_RAW;
@@ -134,6 +136,8 @@ const AUTO_RESTART_BASE_DELAY_MS = (() => {
   const n = parseInt(process.env.LS_AUTO_RESTART_BASE_DELAY_MS || '', 10);
   return Number.isFinite(n) && n > 0 ? n : 1000;
 })();
+const LS_RUN_CHILD_DIRECT = process.env.LS_RUN_CHILD_DIRECT === '1';
+const LS_CHILD_MAX_PROCS = positiveIntEnv('LS_CHILD_MAX_PROCS', 4, 1);
 
 // Pool: key -> { process, port, csrfToken, proxy, startedAt, ready }
 const _pool = new Map();
@@ -1227,6 +1231,15 @@ export async function ensureLs(proxy = null) {
       `--database_dir=${dataDir}/db`,
       '--detect_proxy=false',
     ];
+    if (LS_RUN_CHILD_DIRECT) {
+      // Bypass the LS manager wrapper; it can kill a healthy child when the
+      // first localhost connect probe exceeds its hard-coded 2s window.
+      args.push(
+        '--run_child',
+        '--limit_go_max_procs', String(LS_CHILD_MAX_PROCS),
+        '--child_lock_file', `/tmp/child_lock_${process.pid}_${port}_${Date.now()}`
+      );
+    }
 
     const pUrl = proxyUrl(proxy);
     const env = buildLanguageServerEnv(process.env, { proxyUrl: pUrl });
@@ -1240,7 +1253,7 @@ export async function ensureLs(proxy = null) {
       );
     }
 
-    log.info(`Starting LS instance key=${key} port=${port} proxy=${redactProxyUrl(pUrl)}`);
+    log.info(`Starting LS instance key=${key} port=${port} proxy=${redactProxyUrl(pUrl)} mode=${LS_RUN_CHILD_DIRECT ? 'child' : 'manager'}`);
 
     const proc = spawn(_binaryPath, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -1346,7 +1359,8 @@ export async function ensureLs(proxy = null) {
     });
 
       try {
-        await waitPortReadyOrProcessExit(proc, port, 25000);
+        // High-load VPSes may need more than 25s before the LS port accepts HTTP/2.
+        await waitPortReadyOrProcessExit(proc, port, LS_STARTUP_TIMEOUT_MS);
         entry.ready = true;
         entry.readyAt = Date.now();
         touchEntry(entry);
@@ -1674,7 +1688,7 @@ export async function waitForReady(/* timeoutMs */) {
   const def = _pool.get('default');
   if (!def) throw new Error('default LS not initialized');
   if (def.ready) return true;
-  await waitPortReady(def.port, 20000);
+  await waitPortReady(def.port, LS_READY_TIMEOUT_MS);
   def.ready = true;
   return true;
 }

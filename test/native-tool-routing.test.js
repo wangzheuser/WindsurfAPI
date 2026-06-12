@@ -110,6 +110,65 @@ function parseChatFrames(raw) {
     });
 }
 
+describe('stream tool emulation', () => {
+  it('recovers Claude Code thinking-only Bash narration into streamed tool_calls', async () => {
+    delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE;
+    delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_OFF;
+    const account = addAccountByKey(`stream-nlu-${Date.now()}-${Math.random().toString(36).slice(2)}`, 'stream-nlu');
+    createdAccountIds.push(account.id);
+    const bashTool = {
+      type: 'function',
+      function: {
+        name: 'Bash',
+        description: 'Run a shell command',
+        parameters: {
+          type: 'object',
+          properties: { command: { type: 'string' } },
+          required: ['command'],
+        },
+      },
+    };
+
+    class FakeClient {
+      async cascadeChat(_messages, _modelEnum, _modelUid, opts) {
+        assert.equal(opts.nativeMode, false);
+        opts.onChunk({
+          thinking: '我只需要：\n1. 调用 Bash 工具执行 `printf "TOOLCALL_OK\\n"`\n2. 等待工具执行完成',
+        });
+        return { cascadeId: 'stream-nlu-cascade', sessionId: 'stream-nlu-session', toolCalls: [] };
+      }
+    }
+
+    const result = await handleChatCompletions({
+      model: 'claude-sonnet-4.6',
+      stream: true,
+      __route: 'messages',
+      messages: [{ role: 'user', content: '你必须调用 Bash 工具执行这个精确命令：printf "TOOLCALL_OK\\n"' }],
+      tools: [bashTool],
+    }, {
+      waitForAccount(tried, _signal, _maxWaitMs, modelKey) {
+        return tried.length === 0 ? getApiKey(tried, modelKey) : null;
+      },
+      ensureLs: async () => {},
+      getLsFor: () => ({ port: 17777, csrfToken: 'csrf', generation: 1 }),
+      WindsurfClient: FakeClient,
+    });
+
+    assert.equal(result.status, 200);
+    const res = fakeRes();
+    await result.handler(res);
+    const frames = parseChatFrames(res.body).filter(f => f !== '[DONE]');
+    const toolDeltas = frames.flatMap(f => f.choices || [])
+      .map(c => c.delta?.tool_calls?.[0])
+      .filter(Boolean);
+    assert.equal(toolDeltas.length, 1);
+    assert.equal(toolDeltas[0].function.name, 'Bash');
+    assert.equal(toolDeltas[0].function.arguments, '{"command":"printf \\"TOOLCALL_OK\\\\n\\""}');
+    const finish = frames.flatMap(f => f.choices || []).find(c => c.finish_reason);
+    assert.equal(finish.finish_reason, 'tool_calls');
+  });
+});
+
 describe('native bridge config status', () => {
   it('summarizes gates without exposing API keys or account values', () => {
     process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE = 'all_mapped';

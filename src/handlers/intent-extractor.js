@@ -59,7 +59,7 @@ import { log } from '../config.js';
  */
 function indexTools(tools) {
   const names = new Set();
-  const primaryParam = new Map(); // tool name → first required string param
+  const primaryParam = new Map(); // tool name → inferable single string param
   if (!Array.isArray(tools)) return { names, primaryParam };
   for (const t of tools) {
     if (t?.type !== 'function') continue;
@@ -69,18 +69,18 @@ function indexTools(tools) {
     const params = t.function?.parameters;
     if (params?.type === 'object' && params.properties) {
       const required = Array.isArray(params.required) ? params.required : [];
-      let primary = required[0];
-      // Prefer the first required string-typed param (`command`,
-      // `file_path`, `query`) — that's the one models naturally
-      // mention with "with command X" / "with file Y" narrative.
-      for (const r of required) {
-        const p = params.properties[r];
-        if (p?.type === 'string') { primary = r; break; }
-      }
-      // Fall through to first declared property if no required ones.
-      if (!primary) {
-        const keys = Object.keys(params.properties || {});
-        primary = keys.find(k => params.properties[k]?.type === 'string') || keys[0];
+      const requiredStringKeys = required.filter(r => params.properties[r]?.type === 'string');
+      const stringKeys = Object.keys(params.properties || {})
+        .filter(k => params.properties[k]?.type === 'string');
+      let primary = null;
+      // Layer 2/3 shorthand recovery can only safely fill one argument.
+      // Multi-field tools such as Claude Code's Edit need file_path,
+      // old_string and new_string together; inferring only file_path from
+      // narrative prose creates invalid tool_use blocks and stalls agents.
+      if (required.length === 1 && requiredStringKeys.length === 1) {
+        primary = requiredStringKeys[0];
+      } else if (required.length === 0 && stringKeys.length === 1) {
+        primary = stringKeys[0];
       }
       if (primary) primaryParam.set(name, primary);
     }
@@ -188,7 +188,8 @@ function extractLayer2(text, names, primaryParam) {
       if (!a) continue;
       const value = a[1];
       if (looksLikePlaceholderValue(value)) continue;
-      const param = primaryParam.get(fn) || 'input';
+      const param = primaryParam.get(fn);
+      if (!param) continue;
       out.push({
         name: fn,
         argumentsJson: JSON.stringify({ [param]: value }),
@@ -228,51 +229,208 @@ function extractLayer3(text, names, primaryParam) {
     // Pattern: "<verb> [the] [function|tool] <fn> [function|tool]"
     // \b doesn't match between Chinese and Latin, so we drop the
     // leading word boundary and rely on the verb list itself.
-    const namePat = new RegExp(
-      `${verbs}\\s*${articles}(?:function|tool|method|函数|工具|方法)?\\s*\\\`?${escapeRe(fn)}\\\`?${suffix}`,
-      'gi',
-    );
-    let m;
-    while ((m = namePat.exec(text)) !== null) {
-      // Hunt for value within next 300 chars
-      const tail = text.slice(m.index + m[0].length, m.index + m[0].length + 300);
-      // ordered by specificity:
-      const argPatterns = [
-        // with the command 'echo X' / with command "echo X" / with command `echo X`
-        /\bwith\s+(?:the\s+)?(?:command|argument|param(?:eter)?|input|file[_-]?path|path|query)\s+["'`]([^"'`\n]{1,500})["'`]/i,
-        // bare keyword + value (no "with"): command 'echo X' / argument "X"
-        /(?:^|\s)(?:command|argument|param(?:eter)?|input|file[_-]?path|path|query)\s+["'`]([^"'`\n]{1,500})["'`]/i,
-        // 中文：用命令 'X' / 传入 'X' / 参数 'X' / 命令 'X' / 路径 'X'
-        /(?:用|使用|传入|输入|参数(?:为)?|命令(?:为)?|路径(?:为)?|文件(?:为)?|查询(?:为)?)\s*["'`「『]([^"'`\n「」『』]{1,500})["'`」』]/,
-        // with 'echo X' (no param keyword)
-        /\bwith\s+["'`]([^"'`\n]{1,500})["'`]/i,
-        // to read /etc/hosts (positional after action verb)
-        /\bto\s+(?:read|run|execute|view|search|find|cat|ls)\s+([\S][^\n]{0,200})/i,
-        // : 'echo X' / = 'echo X'
-        /[:=]\s*["'`]([^"'`\n]{1,500})["'`]/,
-        // last resort: very first quoted string in the tail
-        /^[\s,，。.]*["'`「『]([^"'`\n「」『』]{1,500})["'`」』]/,
-      ];
-      let value = null;
-      for (const pat of argPatterns) {
-        const a = tail.match(pat);
-        if (a && a[1]) { value = a[1].trim(); break; }
+    const namePatterns = [
+      new RegExp(
+        `${verbs}\\s*${articles}(?:function|tool|method|函数|工具|方法)?\\s*\\\`?${escapeRe(fn)}\\\`?${suffix}`,
+        'gi',
+      ),
+      new RegExp(`(?:^|\\n)\\s*(?:\\d+[.)]\\s*|[-*]\\s*)?\\\`?${escapeRe(fn)}\\\`?\\s*[:：-]`, 'gi'),
+    ];
+    for (const namePat of namePatterns) {
+      let m;
+      while ((m = namePat.exec(text)) !== null) {
+        // Hunt for value within next 300 chars
+        const tail = text.slice(m.index + m[0].length, m.index + m[0].length + 300);
+        // ordered by specificity:
+        const argPatterns = [
+          // Backtick-delimited command/path/query; allow quotes inside the value.
+          /(?:^|[\s:：，,。.;；])(?:to\s+)?(?:run|execute|exec|call|invoke|use|运行|执行|调用|使用|命令(?:为)?|command(?:\s+is)?)\s*[:：]?\s*`([^`]{1,1000})`/i,
+          // Plan-line value after "Bash:" / "Read:".
+          /^[\s:：—-]*`([^`]{1,1000})`/,
+          // 执行 `printf "OK\n"` / run `printf "OK\n"` — common in Claude Code
+          // thinking text when the model narrates a tool intent instead of
+          // emitting the protocol block.
+          /(?:^|[\s:：，,。.;；])(?:to\s+)?(?:run|execute|exec|call|invoke|use|运行|执行|调用|使用|命令(?:为)?|command(?:\s+is)?)\s*[:：]?\s*["'`「『]([^"'`\n「」『』]{1,500})["'`」』]/i,
+          // 调用 Bash 工具执行：printf "tool-ok\n" — command itself may contain
+          // quotes, so capture the rest of the current plan line.
+          /(?:^|[\s:：，,。.;；])(?:to\s+)?(?:run|execute|exec|运行|执行|命令(?:为)?|command(?:\s+is)?)\s*[:：]\s*([^\n。；;]{1,500})/i,
+          // with the command 'echo X' / with command "echo X" / with command `echo X`
+          /\bwith\s+(?:the\s+)?(?:command|argument|param(?:eter)?|input|file[_-]?path|path|query)\s+["'`]([^"'`\n]{1,500})["'`]/i,
+          // bare keyword + value (no "with"): command 'echo X' / argument "X"
+          /(?:^|\s)(?:command|argument|param(?:eter)?|input|file[_-]?path|path|query)\s+["'`]([^"'`\n]{1,500})["'`]/i,
+          // 中文：用命令 'X' / 传入 'X' / 参数 'X' / 命令 'X' / 路径 'X'
+          /(?:用|使用|传入|输入|参数(?:为)?|命令(?:为)?|路径(?:为)?|文件(?:为)?|查询(?:为)?)\s*[:：]?\s*["'`「『]([^"'`\n「」『』]{1,500})["'`」』]/,
+          // with 'echo X' (no param keyword)
+          /\bwith\s+["'`]([^"'`\n]{1,500})["'`]/i,
+          // to read /etc/hosts (positional after action verb)
+          /\bto\s+(?:read|run|execute|view|search|find|cat|ls)\s+([\S][^\n]{0,200})/i,
+          // Bash: printf "OK\n" / shell_exec - echo OK (single-line plan form)
+          /^[\s:：—-]+([^\n。；;]{1,500})/,
+          // : 'echo X' / = 'echo X'
+          /[:=]\s*["'`]([^"'`\n]{1,500})["'`]/,
+          // last resort: very first quoted string in the tail
+          /^[\s,，。.]*["'`「『]([^"'`\n「」『』]{1,500})["'`」』]/,
+        ];
+        let value = null;
+        for (const pat of argPatterns) {
+          const a = tail.match(pat);
+          if (a && a[1]) { value = a[1].trim(); break; }
+        }
+        if (!value) continue;
+        const param = primaryParam.get(fn);
+        if (!param) continue;
+        value = normalizeNarrativeValue(param, value);
+        if (!value) continue;
+        // v2.0.76 + v2.0.78 (audit H-2): reject placeholder keywords
+        // (`command` / `argument` / ...) AND article-led prose phrases
+        // (`a shell command` / `the file` / `your input`). GLM-4.7
+        // narrative reproducer "to run a shell command" was capturing
+        // "a shell command." as the value pre-v2.0.78 even with the
+        // single-word filter in place.
+        if (looksLikePlaceholderValue(value)) continue;
+        out.push({
+          name: fn,
+          argumentsJson: JSON.stringify({ [param]: value }),
+          layer: 'narrative',
+          confidence: 0.65,
+        });
       }
-      if (!value) continue;
-      // v2.0.76 + v2.0.78 (audit H-2): reject placeholder keywords
-      // (`command` / `argument` / ...) AND article-led prose phrases
-      // (`a shell command` / `the file` / `your input`). GLM-4.7
-      // narrative reproducer "to run a shell command" was capturing
-      // "a shell command." as the value pre-v2.0.78 even with the
-      // single-word filter in place.
-      if (looksLikePlaceholderValue(value)) continue;
-      const param = primaryParam.get(fn) || 'input';
+    }
+  }
+  return out;
+}
+
+function normalizeNarrativeValue(param, value) {
+  if (typeof value !== 'string') return null;
+  let v = value.trim();
+  if (!v) return null;
+  if (param === 'command') {
+    v = v.replace(/^(?:Bash\s+)?command\s*[:：]\s*/i, '').trim();
+    v = v.replace(/^Bash\s*[:：]\s*/i, '').trim();
+    // Do not re-run historical steps described as already completed.
+    if (/(?:已(?:经)?完成|完成|done|completed)/i.test(v)) return null;
+    // Keep the executable command, not the explanatory sentence after it.
+    v = v.replace(/\s+(?:[-—–]\s*)?(?:已(?:经)?完成|完成|done|completed).*$/i, '').trim();
+    // Reject Chinese prose that is not a shell command.
+    if (/^(?:创建|新建|读取|修改|编辑|使用|调用|执行|运行|列出|查看|搜索|检查|确认|等待|把|将|来|去|为了|然后|再|先)/.test(v)) return null;
+    // Chinese prose such as "来列出当前工作目录下的文件" is not a shell
+    // command. Keep real shell commands that merely contain CJK text.
+    if (/[\p{Script=Han}]/u.test(v) && !shellCommandLooksConcrete(v)) return null;
+  }
+  return v || null;
+}
+
+function shellCommandLooksConcrete(value) {
+  return /^(?:printf|echo|cat|ls|pwd|grep|find|sed|awk|python3?|node|npm|pnpm|yarn|curl|mkdir|touch|cp|mv|rm|git|docker|bash|sh)\b/.test(value)
+    || /(?:^|\s)(?:>|>>|\|\||&&|\|)(?:\s|$)/.test(value);
+}
+
+function preferredName(names, candidates) {
+  for (const name of candidates) {
+    if (names.has(name)) return name;
+  }
+  return null;
+}
+
+/**
+ * 判断当前步骤匹配片段是否只是回顾已经完成的历史步骤。
+ */
+function looksLikeCompletedStepReference(snippet) {
+  const s = String(snippet || '');
+  return /(?:已经|已|刚刚|previously|already)[^\n。；;]{0,30}(?:完成|执行|运行|调用|处理|读取|编辑|做|complete|completed|ran|called|read|edited)/i.test(s)
+    || /(?:完成|执行|运行|调用|处理|读取|编辑|做|尝试执行)了[^\n。；;]{0,20}(?:步骤|step)\s*\d+/i.test(s);
+}
+
+function detectActivePlanStepRange(text) {
+  const patterns = [
+    /(?:先|首先|当前|现在|本轮|只|仅|first|now|only)[^\n。；;]{0,50}(?:执行|运行|调用|处理|做|开始|execute|run|call|do)[^\n。；;]{0,30}(?:步骤|step(?:s)?)\s*(\d+)\s*(?:[-–—~至到]|to|through)\s*(\d+)/gi,
+  ];
+  for (const pattern of patterns) {
+    let m;
+    while ((m = pattern.exec(text)) !== null) {
+      if (looksLikeCompletedStepReference(m[0])) continue;
+      const a = Number.parseInt(m[1], 10);
+      const b = Number.parseInt(m[2], 10);
+      if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
+      return { start: Math.min(a, b), end: Math.max(a, b) };
+    }
+  }
+  const singleRe = /(?:接下来|下一步|然后|再|先|首先|当前|现在|本轮|只|仅|next|then|first|now|only)[^\n。；;]{0,50}(?:执行|运行|调用|处理|做|读取|编辑|execute|run|call|do|read|edit)[^\n。；;]{0,30}(?:步骤|step)\s*(\d+)(?!\s*(?:[-–—~至到]|to|through)\s*\d+)/gi;
+  let single;
+  while ((single = singleRe.exec(text)) !== null) {
+    if (looksLikeCompletedStepReference(single[0])) continue;
+    const stepNo = Number.parseInt(single[1], 10);
+    if (Number.isFinite(stepNo)) return { start: stepNo, end: stepNo };
+  }
+  return null;
+}
+
+function filterPlanTextToActiveStepRange(text) {
+  const range = detectActivePlanStepRange(text);
+  if (!range) return text;
+  const kept = [];
+  for (const line of text.split(/\n/)) {
+    const stepNos = [
+      ...[...line.matchAll(/^\s*(?:[-*]\s*)?(?:(?:步骤|step)\s*)?(\d+)[.)：:]/ig)].map(m => m[1]),
+      ...[...line.matchAll(/(?:^|[\s，,。；;])(?:接下来|下一步|然后|再|先|首先|当前|现在|本轮|只|仅|next|then|first|now|only)[^\n。；;]{0,60}(?:步骤|step)\s*(\d+)\s*[.)：:]/ig)].map(m => m[1]),
+    ].map(n => Number.parseInt(n, 10)).filter(Number.isFinite);
+    if (stepNos.some(stepNo => stepNo >= range.start && stepNo <= range.end)) kept.push(line);
+  }
+  return kept.join('\n');
+}
+
+function extractClaudeCodePlanLines(text, names) {
+  const out = [];
+  const planText = filterPlanTextToActiveStepRange(text);
+  const bashName = preferredName(names, ['Bash', 'shell_exec', 'shell_command']);
+  if (bashName) {
+    const lineRe = /(?:^|\n)\s*(?:[-*]\s*|\d+[.)]\s*|步骤\s*\d+\s*[:：]\s*)(?:Bash\s*[:：-]\s*)?([^\n。；;]{1,500})/gi;
+    let m;
+    while ((m = lineRe.exec(planText)) !== null) {
+      const command = normalizeNarrativeValue('command', m[1]);
+      if (!command || !shellCommandLooksConcrete(command)) continue;
       out.push({
-        name: fn,
-        argumentsJson: JSON.stringify({ [param]: value }),
+        name: bashName,
+        argumentsJson: JSON.stringify({ command }),
         layer: 'narrative',
         confidence: 0.65,
       });
+    }
+  }
+
+  const editName = preferredName(names, ['Edit']);
+  if (editName) {
+    const editPatterns = [
+      /(?:Edit\s*(?:工具)?|使用\s*Edit\s*(?:工具)?|调用\s*Edit\s*(?:工具)?)[^\n。；;]{0,80}?file_path\s*[:=]\s*([A-Za-z0-9_./-]+)[,\s，]+old_string\s*[:=]\s*["'`「『]?([^"'`「」『』\s，,。；;]+)["'`」』]?[,\s，]+new_string\s*[:=]\s*["'`「『]?([^"'`「」『』\s，,。；;]+)["'`」』]?/gi,
+      /(?:把|将)\s*([A-Za-z0-9_./-]+)\s*(?:中|中的|里|里的|内|内的)\s*["'`「『]?([^"'`「」『』\s，。；;]+)["'`」』]?\s*(?:修改为|改为|替换为|变成|=>|->|为)\s*["'`「『]?([^"'`「」『』\s，。；;]+)["'`」』]?/gi,
+      /(?:Edit\s*(?:工具)?|使用\s*Edit\s*(?:工具)?|调用\s*Edit\s*(?:工具)?)[^\n。；;]{0,80}?\s*([A-Za-z0-9_./-]+)\s*(?:中|中的|里|里的|内|内的)\s*["'`「『]?([^"'`「」『』\s，。；;]+)["'`」』]?\s*(?:修改为|改为|替换为|变成|=>|->|为)\s*["'`「『]?([^"'`「」『』\s，。；;]+)["'`」』]?/gi,
+    ];
+    for (const editRe of editPatterns) {
+      let m;
+      while ((m = editRe.exec(planText)) !== null) {
+        out.push({
+          name: editName,
+          argumentsJson: JSON.stringify({ file_path: m[1].trim(), old_string: m[2].trim(), new_string: m[3].trim() }),
+          layer: 'narrative',
+          confidence: 0.65,
+        });
+      }
+    }
+  }
+
+  const readName = preferredName(names, ['Read']);
+  if (readName) {
+    const readRe = /(?:Read\s*(?:工具)?|使用\s*Read\s*(?:工具)?|调用\s*Read\s*(?:工具)?|读取)\s*(?:file_path\s*[:=]\s*)?([A-Za-z0-9_./-]+\.[A-Za-z0-9_-]+)(?:\s*(?:和|,|，|and)\s*(?:file_path\s*[:=]\s*)?([A-Za-z0-9_./-]+\.[A-Za-z0-9_-]+))?/gi;
+    let m;
+    while ((m = readRe.exec(planText)) !== null) {
+      for (const filePath of [m[1], m[2]].filter(Boolean)) {
+        out.push({
+          name: readName,
+          argumentsJson: JSON.stringify({ file_path: filePath.trim() }),
+          layer: 'narrative',
+          confidence: 0.65,
+        });
+      }
     }
   }
   return out;
@@ -376,10 +534,13 @@ export function extractIntentFromNarrative(text, tools, opts = {}) {
   const { names, primaryParam } = indexTools(tools);
   if (!names.size) return [];
 
+  const actionableNarrative = !skipLayer3 && userPromptLooksActionable(lastUserText);
+  const scopedNarrativeText = actionableNarrative ? filterPlanTextToActiveStepRange(text) : text;
   const all = [
     ...extractLayer1(text, names),
     ...extractLayer2(text, names, primaryParam),
-    ...(!skipLayer3 && userPromptLooksActionable(lastUserText) ? extractLayer3(text, names, primaryParam) : []),
+    ...(actionableNarrative ? extractClaudeCodePlanLines(text, names) : []),
+    ...(actionableNarrative ? extractLayer3(scopedNarrativeText, names, primaryParam) : []),
   ];
   if (!all.length) return [];
 

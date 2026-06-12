@@ -23,6 +23,7 @@ const fnTool = (name, props = { command: 'string' }, required = ['command']) => 
 });
 
 const SHELL_TOOL = fnTool('shell_exec');
+const BASH_TOOL = fnTool('Bash');
 const READ_TOOL = fnTool('Read', { file_path: 'string' }, ['file_path']);
 const ACTIONABLE = { lastUserText: 'run shell_exec to echo something' };
 
@@ -99,6 +100,249 @@ describe('Layer 3 — natural narrative (live GLM-4.7 reproducer)', () => {
     );
     assert.equal(r.length, 1);
     assert.equal(r[0].name, 'shell_exec');
+  });
+
+  it('recovers Claude Code thinking narration with a quoted Bash command', () => {
+    const r = extractIntentFromNarrative(
+      '我只需要：\n1. 调用 Bash 工具执行 `printf "TOOLCALL_OK\\n"`\n2. 等待工具执行完成',
+      [BASH_TOOL],
+      { lastUserText: '你必须调用 Bash 工具执行这个精确命令：printf "TOOLCALL_OK\\n"' },
+    );
+    assert.equal(r.length, 1);
+    assert.equal(r[0].name, 'Bash');
+    assert.deepEqual(JSON.parse(r[0].argumentsJson), { command: 'printf "TOOLCALL_OK\\n"' });
+  });
+
+  it('recovers Claude Code numbered Chinese plan with an unquoted Bash command', () => {
+    const r = extractIntentFromNarrative(
+      '让我按照步骤执行：\n1. 调用 Bash 工具执行：printf "tool-ok\\n"\n2. 新建 generated.txt',
+      [BASH_TOOL],
+      { lastUserText: '调用 Bash 工具执行：printf "tool-ok\\n"' },
+    );
+    assert.equal(r.length, 1);
+    assert.equal(r[0].name, 'Bash');
+    assert.deepEqual(JSON.parse(r[0].argumentsJson), { command: 'printf "tool-ok\\n"' });
+  });
+
+  it('recovers Claude Code numbered plan lines like Bash: command', () => {
+    const r = extractIntentFromNarrative(
+      '步骤：\n1. Bash: printf "tool-ok\\n"\n2. Bash: echo "created-by-claude-code" > generated.txt',
+      [BASH_TOOL],
+      { lastUserText: '调用 Bash 工具创建文件并输出 tool-ok' },
+    );
+    assert.deepEqual(
+      r.map(x => JSON.parse(x.argumentsJson).command),
+      ['printf "tool-ok\\n"', 'echo "created-by-claude-code" > generated.txt'],
+    );
+  });
+
+  it('recovers concrete shell commands from Claude Code step labels', () => {
+    const r = extractIntentFromNarrative(
+      '步骤1: printf "tool-ok\\n"\n步骤2: printf "created-by-claude-code\\n" > generated.txt\n步骤3: printf "before-edit\\n" > edit-target.txt',
+      [BASH_TOOL],
+      { lastUserText: '用 Bash 创建 generated.txt 和 edit-target.txt' },
+    );
+    assert.deepEqual(
+      r.map(x => JSON.parse(x.argumentsJson).command),
+      [
+        'printf "tool-ok\\n"',
+        'printf "created-by-claude-code\\n" > generated.txt',
+        'printf "before-edit\\n" > edit-target.txt',
+      ],
+    );
+  });
+
+  it('strips Claude Code Bash command labels before executing', () => {
+    const r = extractIntentFromNarrative(
+      '1. Bash command: printf "created-by-claude-code\\n" > generated.txt',
+      [BASH_TOOL],
+      { lastUserText: 'Bash command: printf "created-by-claude-code\\n" > generated.txt' },
+    );
+    assert.equal(r.length, 1);
+    assert.deepEqual(JSON.parse(r[0].argumentsJson), {
+      command: 'printf "created-by-claude-code\\n" > generated.txt',
+    });
+  });
+
+  it('does not recover already-completed Bash steps', () => {
+    const r = extractIntentFromNarrative(
+      '1. 调用 Bash 工具执行：printf "tool-ok\\n" - 已经完成',
+      [BASH_TOOL],
+      { lastUserText: '调用 Bash 工具执行：printf "tool-ok\\n"' },
+    );
+    assert.equal(r.length, 0);
+  });
+
+  it('does not recover Bash history lines marked simply as 完成', () => {
+    const r = extractIntentFromNarrative(
+      '1. Bash command: printf "tool-ok\\n" - 完成\n现在执行步骤4：Read file_path: edit-target.txt',
+      [BASH_TOOL, READ_TOOL],
+      { lastUserText: '分轮执行 Bash 和 Read' },
+    );
+    assert.deepEqual(r.map(x => [x.name, JSON.parse(x.argumentsJson)]), [
+      ['Read', { file_path: 'edit-target.txt' }],
+    ]);
+  });
+
+  it('does not treat completed step ranges as the active range', () => {
+    const r = extractIntentFromNarrative(
+      '我已经完成了步骤1-3：\n'
+        + '1. Bash command: printf "tool-ok\\n" - 完成\n'
+        + '2. Bash command: printf "created-by-claude-code\\n" > generated.txt - 完成\n'
+        + '3. Bash command: printf "before-edit\\n" > edit-target.txt - 完成\n'
+        + '现在收到了步骤1-3的结果，根据指示，接下来应该执行：\n'
+        + '4. Read file_path: edit-target.txt',
+      [BASH_TOOL, READ_TOOL],
+      { lastUserText: '分轮执行 Bash 和 Read' },
+    );
+    assert.deepEqual(r.map(x => [x.name, JSON.parse(x.argumentsJson)]), [
+      ['Read', { file_path: 'edit-target.txt' }],
+    ]);
+  });
+
+  it('recovers Edit old/new arguments from Claude Code Chinese plan text', () => {
+    const editTool = { type: 'function', function: { name: 'Edit', parameters: { type: 'object', properties: { file_path: { type: 'string' }, old_string: { type: 'string' }, new_string: { type: 'string' } } } } };
+    const r = extractIntentFromNarrative(
+      '使用 Edit 工具把 edit-target.txt 中的 before-edit 修改为 after-edit',
+      [editTool],
+      { lastUserText: '使用 Edit 工具把 edit-target.txt 中的 before-edit 修改为 after-edit' },
+    );
+    assert.equal(r.length, 1);
+    assert.deepEqual(JSON.parse(r[0].argumentsJson), {
+      file_path: 'edit-target.txt',
+      old_string: 'before-edit',
+      new_string: 'after-edit',
+    });
+  });
+
+  it('recovers Edit and Read field-label plan lines', () => {
+    const editTool = { type: 'function', function: { name: 'Edit', parameters: { type: 'object', properties: { file_path: { type: 'string' }, old_string: { type: 'string' }, new_string: { type: 'string' } } } } };
+    const readTool = { type: 'function', function: { name: 'Read', parameters: { type: 'object', properties: { file_path: { type: 'string' } } } } };
+    const r = extractIntentFromNarrative(
+      '4. Edit file_path: edit-target.txt, old_string: before-edit, new_string: after-edit\n5. Read file_path: generated.txt\n6. Read file_path: edit-target.txt',
+      [editTool, readTool],
+      { lastUserText: 'Edit file_path: edit-target.txt old_string: before-edit new_string: after-edit Read file_path: generated.txt' },
+    );
+    assert.deepEqual(r.map(x => [x.name, JSON.parse(x.argumentsJson)]), [
+      ['Edit', { file_path: 'edit-target.txt', old_string: 'before-edit', new_string: 'after-edit' }],
+      ['Read', { file_path: 'generated.txt' }],
+      ['Read', { file_path: 'edit-target.txt' }],
+    ]);
+  });
+
+  it('does not fabricate partial Edit calls from generic retry prose', () => {
+    const editTool = fnTool(
+      'Edit',
+      { file_path: 'string', old_string: 'string', new_string: 'string' },
+      ['file_path', 'old_string', 'new_string'],
+    );
+    const r = extractIntentFromNarrative(
+      '所以问题是 Edit 工具要求先读取文件才能编辑。我需要先读取 edit-target.txt，然后再执行 Edit 操作。',
+      [editTool, READ_TOOL],
+      { lastUserText: '使用 Edit 工具把 edit-target.txt 中的 before-edit 修改为 after-edit' },
+    );
+    assert.deepEqual(r.map(x => [x.name, JSON.parse(x.argumentsJson)]), [
+      ['Read', { file_path: 'edit-target.txt' }],
+    ]);
+  });
+
+  it('honours Claude Code current-step range before promoting plan lines', () => {
+    const editTool = fnTool(
+      'Edit',
+      { file_path: 'string', old_string: 'string', new_string: 'string' },
+      ['file_path', 'old_string', 'new_string'],
+    );
+    const text = `我需要按照这些步骤执行。
+1. Bash command: printf "tool-ok\\n"
+2. Bash command: printf "created-by-claude-code\\n" > generated.txt
+3. Bash command: printf "before-edit\\n" > edit-target.txt
+4. Edit file_path: edit-target.txt, old_string: before-edit, new_string: after-edit
+5. Read file_path: generated.txt
+6. Read file_path: edit-target.txt
+
+让我先并行执行步骤1-3。`;
+    const r = extractIntentFromNarrative(
+      text,
+      [BASH_TOOL, editTool, READ_TOOL],
+      { lastUserText: '真实调用工具创建并编辑文件' },
+    );
+    assert.deepEqual(r.map(x => [x.name, JSON.parse(x.argumentsJson)]), [
+      ['Bash', { command: 'printf "tool-ok\\n"' }],
+      ['Bash', { command: 'printf "created-by-claude-code\\n" > generated.txt' }],
+      ['Bash', { command: 'printf "before-edit\\n" > edit-target.txt' }],
+    ]);
+  });
+
+  it('honours Claude Code current single-step intent before promoting plan lines', () => {
+    const editTool = fnTool(
+      'Edit',
+      { file_path: 'string', old_string: 'string', new_string: 'string' },
+      ['file_path', 'old_string', 'new_string'],
+    );
+    const text = `1. Read file_path: edit-target.txt
+2. Edit file_path: edit-target.txt, old_string: before-edit, new_string: after-edit
+3. Read file_path: edit-target.txt
+
+接下来执行步骤2。`;
+    const r = extractIntentFromNarrative(
+      text,
+      [editTool, READ_TOOL],
+      { lastUserText: '使用 Edit 工具把 edit-target.txt 中的 before-edit 修改为 after-edit' },
+    );
+    assert.deepEqual(r.map(x => [x.name, JSON.parse(x.argumentsJson)]), [
+      ['Edit', { file_path: 'edit-target.txt', old_string: 'before-edit', new_string: 'after-edit' }],
+    ]);
+  });
+
+  it('skips completed Read history before recovering the current Edit step', () => {
+    const editTool = fnTool(
+      'Edit',
+      { file_path: 'string', old_string: 'string', new_string: 'string' },
+      ['file_path', 'old_string', 'new_string'],
+    );
+    const text = `用户要求我必须分轮执行，不能提前调用未来步骤。现在我已经完成了步骤1-3：
+1. Bash command: printf "tool-ok\\n" - 完成，输出 "tool-ok"
+2. Bash command: printf "created-by-claude-code\\n" > generated.txt - 完成
+3. Bash command: printf "before-edit\\n" > edit-target.txt - 完成
+
+然后我执行了步骤4：
+4. Read file_path: edit-target.txt - 完成，内容是 "before-edit"
+
+现在根据指示，收到步骤4结果后，再执行步骤5：
+5. Edit file_path: edit-target.txt, old_string: before-edit, new_string: after-edit
+
+我需要执行这个Edit操作。`;
+    const r = extractIntentFromNarrative(
+      text,
+      [BASH_TOOL, editTool, READ_TOOL],
+      { lastUserText: '真实调用工具创建、读取并编辑文件' },
+    );
+    assert.deepEqual(r.map(x => [x.name, JSON.parse(x.argumentsJson)]), [
+      ['Edit', { file_path: 'edit-target.txt', old_string: 'before-edit', new_string: 'after-edit' }],
+    ]);
+  });
+
+  it('keeps inline active-step lines before recovering Edit', () => {
+    const editTool = fnTool(
+      'Edit',
+      { file_path: 'string', old_string: 'string', new_string: 'string' },
+      ['file_path', 'old_string', 'new_string'],
+    );
+    const text = `现在已经完成了步骤1-3，收到了步骤4的结果（读取edit-target.txt文件，内容是"before-edit"）。
+
+根据指令，接下来应该执行步骤5：Edit file_path: edit-target.txt, old_string: before-edit, new_string: after-edit
+
+然后收到步骤5结果后，再执行步骤6和7：Read generated.txt 和 Read edit-target.txt
+
+现在执行步骤5。`;
+    const r = extractIntentFromNarrative(
+      text,
+      [BASH_TOOL, editTool, READ_TOOL],
+      { lastUserText: '真实调用工具创建、读取并编辑文件' },
+    );
+    assert.deepEqual(r.map(x => [x.name, JSON.parse(x.argumentsJson)]), [
+      ['Edit', { file_path: 'edit-target.txt', old_string: 'before-edit', new_string: 'after-edit' }],
+    ]);
   });
 
   it("'I'll invoke the Read tool to read /etc/hosts'", () => {
