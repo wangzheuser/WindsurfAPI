@@ -545,6 +545,7 @@ export function setAccountBlockedModels(id, blockedModels) {
 export function isModelAllowedForAccount(account, modelKey) {
   const blocked = account.blockedModels || [];
   if (blocked.includes(modelKey)) return false;
+  if (MODELS[modelKey]?.deprecated) return false;
   // tierManual is the operator escape hatch: when set, trust the manual
   // tier table over GetUserStatus's per-account allowlist. Useful when
   // probe-based detection misclassified a Pro/Trial account as free
@@ -557,6 +558,9 @@ export function isModelAllowedForAccount(account, modelKey) {
     if (cap?.reason === 'user_status' || cap?.reason === 'not_entitled') {
       return cap.ok === true;
     }
+    // Dynamic UID-only models may not appear in GetUserStatus's enum-keyed
+    // allowlist. Trust a persisted live success so routing survives restarts.
+    if (cap?.reason === 'success' && cap.ok === true) return true;
   }
   const tierModels = getTierModels(account.tier || 'unknown');
   return tierModels.includes(modelKey);
@@ -574,10 +578,24 @@ export function getAvailableModelsForAccount(account) {
   // enum-keyed catalog entry; UID-only entries (no enum) fall back to tier.
   const allowed = [];
   for (const [key, info] of Object.entries(MODELS)) {
+    if (info.deprecated) continue;
     if (blocked.has(key)) continue;
+    const cap = account.capabilities[key];
+    if (!account.tierManual) {
+      if (cap?.reason === 'user_status') {
+        if (cap.ok === true) allowed.push(key);
+        continue;
+      }
+      if (cap?.reason === 'not_entitled') continue;
+      // Preserve successful live probes for dynamic UID-only models whose
+      // cloud config has no enum and therefore no user_status allowlist row.
+      if (cap?.reason === 'success' && cap.ok === true) {
+        allowed.push(key);
+        continue;
+      }
+    }
     if (info.enumValue && info.enumValue > 0) {
-      const cap = account.capabilities[key];
-      if (cap?.reason === 'user_status' && cap.ok === true) allowed.push(key);
+      continue;
     } else if (tierModels.includes(key)) {
       allowed.push(key);
     }

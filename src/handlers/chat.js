@@ -951,6 +951,10 @@ export function rateLimitCooldownMs(message = '') {
   return parseRateLimitCooldownMs(message) || 60 * 1000;
 }
 
+export function isRateLimitLikeMessage(message = '') {
+  return /rate limit|rate_limit|too many requests|quota|high demand|temporarily at capacity|please try again later/i.test(String(message || ''));
+}
+
 function formatRetryAfter(ms) {
   const seconds = Math.max(1, Math.ceil(Number(ms) / 1000));
   if (seconds >= 3600) {
@@ -2993,7 +2997,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     // Only count true auth failures against the account. Workspace/cascade/model
     // errors and transport issues shouldn't disable the key.
     const isAuthFail = /unauthenticated|invalid api key|invalid_grant|permission_denied.*account/i.test(err.message);
-    const isRateLimit = /rate limit|rate_limit|too many requests|quota/i.test(err.message);
+    const isRateLimit = isRateLimitLikeMessage(err.message);
     const isInternal = /internal error occurred.*error id/i.test(err.message);
     const isDeadline = isUpstreamDeadlineExceeded(err);
     const isTransport = isCascadeTransportError(err);
@@ -3884,7 +3888,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
               reuseEntryDead = true;
             }
             const isAuthFail = /unauthenticated|invalid api key|invalid_grant|permission_denied.*account/i.test(err.message);
-            const isRateLimit = /rate limit|rate_limit|too many requests|quota/i.test(err.message);
+            const isRateLimit = isRateLimitLikeMessage(err.message);
             const isInternal = /internal error occurred.*error id/i.test(err.message);
             const isTransport = isCascadeTransportError(err);
             const isTransient = !isDeadline && isUpstreamTransientError(err, isInternal);

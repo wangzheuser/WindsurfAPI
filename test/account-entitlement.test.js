@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { isModelAllowedForAccount, getAvailableModelsForAccount } from '../src/auth.js';
+import { MODELS } from '../src/models.js';
 
 // Free Windsurf accounts entitled by `cascade_allowed_models_config` to
 // GLM/SWE/Kimi were getting routed away from the proxy because
@@ -65,6 +66,30 @@ describe('isModelAllowedForAccount — capabilities-first routing', () => {
     assert.equal(isModelAllowedForAccount(account, 'gemini-2.5-flash'), true);
   });
 
+  it('honours persisted success for dynamic UID-only models after restart', () => {
+    const original = MODELS['swe-1-6-slow'];
+    MODELS['swe-1-6-slow'] = {
+      name: 'swe-1-6-slow',
+      provider: 'windsurf',
+      enumValue: 0,
+      modelUid: 'swe-1-6-slow',
+      credit: 1,
+    };
+    try {
+      const account = {
+        tier: 'free',
+        userStatusLastFetched: Date.now(),
+        capabilities: {
+          'swe-1-6-slow': { ok: true, reason: 'success', lastCheck: 1 },
+        },
+      };
+      assert.equal(isModelAllowedForAccount(account, 'swe-1-6-slow'), true);
+    } finally {
+      if (original) MODELS['swe-1-6-slow'] = original;
+      else delete MODELS['swe-1-6-slow'];
+    }
+  });
+
   it('manual tier=pro override unlocks all models even with not_entitled caps', () => {
     // Operator escape hatch: probe misclassified a Pro trial as free,
     // GetUserStatus then wrote not_entitled into every premium model's
@@ -106,6 +131,35 @@ describe('getAvailableModelsForAccount — uses authoritative allowlist post-sta
     assert.ok(got.includes('swe-1.5'));
     assert.ok(!got.includes('claude-opus-4.6'));
     assert.ok(!got.includes('gpt-4.1-mini'));
+  });
+
+  it('returns persisted successful dynamic models and hides deprecated entries', () => {
+    const original = MODELS['swe-1-6-slow'];
+    MODELS['swe-1-6-slow'] = {
+      name: 'swe-1-6-slow',
+      provider: 'windsurf',
+      enumValue: 0,
+      modelUid: 'swe-1-6-slow',
+      credit: 1,
+    };
+    try {
+      const account = {
+        tier: 'free',
+        userStatusLastFetched: Date.now(),
+        capabilities: {
+          'swe-1-6-slow': { ok: true, reason: 'success', lastCheck: 1 },
+          'gpt-4o-mini': { ok: true, reason: 'user_status', lastCheck: 1 },
+          'gemini-2.5-flash': { ok: true, reason: 'user_status', lastCheck: 1 },
+        },
+      };
+      const got = getAvailableModelsForAccount(account);
+      assert.ok(got.includes('swe-1-6-slow'));
+      assert.ok(got.includes('gemini-2.5-flash'));
+      assert.ok(!got.includes('gpt-4o-mini'));
+    } finally {
+      if (original) MODELS['swe-1-6-slow'] = original;
+      else delete MODELS['swe-1-6-slow'];
+    }
   });
 
   it('falls back to tier list before GetUserStatus runs', () => {

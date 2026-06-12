@@ -10,7 +10,7 @@ import {
   removeAccount,
   setAccountTier,
 } from '../src/auth.js';
-import { handleChatCompletions, rateLimitBurstCooldownMs, rateLimitCooldownMs } from '../src/handlers/chat.js';
+import { handleChatCompletions, isRateLimitLikeMessage, rateLimitBurstCooldownMs, rateLimitCooldownMs } from '../src/handlers/chat.js';
 import { getExperimental, setExperimental } from '../src/runtime-config.js';
 
 const createdAccountIds = [];
@@ -62,6 +62,13 @@ describe('rate-limit handling', () => {
   it('parses explicit retry-after seconds instead of defaulting to five minutes', () => {
     assert.equal(rateLimitCooldownMs('Please retry after 117 seconds'), 117000);
     assert.equal(rateLimitCooldownMs('quota hit'), 60000);
+  });
+
+  it('treats upstream high-demand model errors as temporary rate limits', () => {
+    assert.equal(
+      isRateLimitLikeMessage("We're currently facing high demand for this model. Please try again later. (trace ID: abc)"),
+      true
+    );
   });
 
   it('parses Cascade reset windows into real model cooldowns', () => {
