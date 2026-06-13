@@ -317,6 +317,12 @@ function normalizeNarrativeValue(param, value) {
     // command. Keep real shell commands that merely contain CJK text.
     if (/[\p{Script=Han}]/u.test(v) && !shellCommandLooksConcrete(v)) return null;
   }
+  if (param === 'file_path') {
+    v = v.replace(/[.,;:!?。，；：！？]+$/, '').trim();
+    // Avoid promoting prose such as "or Bash to confirm generated.txt".
+    if (/^(?:or|and|或|和)\b/i.test(v)) return null;
+    if (/\s/.test(v)) return null;
+  }
   return v || null;
 }
 
@@ -381,15 +387,82 @@ function filterPlanTextToActiveStepRange(text) {
 
 function extractClaudeCodePlanLines(text, names) {
   const out = [];
+  const add = (index, call) => out.push({ ...call, _pos: Number.isFinite(index) ? index : text.length });
   const planText = filterPlanTextToActiveStepRange(text);
+  const filePath = '((?:\\.{1,2}/|/)?[A-Za-z0-9_./~@%+=:,\\\\-]+(?:\\.[A-Za-z0-9_\\\\-]+)?)';
+  const quotedValue = '["\'`「『]([^"\'`\\n「」『』]{1,1000})["\'`」』]';
+
+  /**
+   * 归一化计划行中抽取出的路径或内容，避免把句末标点带入工具参数。
+   */
+  const cleanPlanValue = (value) => String(value || '')
+    .trim()
+    .replace(/[.,;:!?。，；：！？]+$/g, '')
+    .trim();
+
+  /**
+   * 截取命中项所在的计划行，用于判断该行是否只是历史回顾。
+   */
+  const lineAt = (index) => {
+    const start = Math.max(0, planText.lastIndexOf('\n', Math.max(0, index - 1)) + 1);
+    const end = planText.indexOf('\n', index);
+    return planText.slice(start, end === -1 ? planText.length : end);
+  };
+
+  /**
+   * 跳过“已完成/已读取/已执行”的历史步骤；“还未完成/需要执行”仍保留。
+   */
+  const lineLooksAlreadyDone = (line) => {
+    const s = String(line || '');
+    if (/(?:还未|尚未|未完成|未执行|未读取|未编辑|未写入|还没|没做|需要(?:执行|编辑|写入|创建|读取)|待执行|not yet|needs?|todo)/i.test(s)) {
+      return false;
+    }
+    return /(?:已(?:经)?(?:完成|读取|执行|运行|编辑|写入|创建)|完成(?:，|。|\)|）|$)|done|completed|already (?:done|completed|ran|read|edited|written))/i.test(s);
+  };
+
+  /**
+   * 清理内容值末尾的计划状态短语，例如 “ - 还未完成”。
+   */
+  const cleanContentValue = (value) => {
+    let v = cleanPlanValue(value)
+      .replace(/\s+[-—–]\s*(?:已(?:经)?完成|还未完成|尚未完成|还没做|需要执行|not yet|done|completed).*$/i, '')
+      .trim();
+    const quotePairs = [['"', '"'], ["'", "'"], ['`', '`'], ['「', '」'], ['『', '』']];
+    for (const [left, right] of quotePairs) {
+      if (v.startsWith(left) && v.endsWith(right) && v.length >= left.length + right.length) {
+        v = v.slice(left.length, -right.length).trim();
+        break;
+      }
+    }
+    return v;
+  };
+
   const bashName = preferredName(names, ['Bash', 'shell_exec', 'shell_command']);
   if (bashName) {
     const lineRe = /(?:^|\n)\s*(?:[-*]\s*|\d+[.)]\s*|步骤\s*\d+\s*[:：]\s*)(?:Bash\s*[:：-]\s*)?([^\n。；;]{1,500})/gi;
     let m;
     while ((m = lineRe.exec(planText)) !== null) {
+      if (lineLooksAlreadyDone(lineAt(m.index))) continue;
       const command = normalizeNarrativeValue('command', m[1]);
       if (!command || !shellCommandLooksConcrete(command)) continue;
-      out.push({
+      add(m.index, {
+        name: bashName,
+        argumentsJson: JSON.stringify({ command }),
+        layer: 'narrative',
+        confidence: 0.65,
+      });
+    }
+    const bashToolRe = new RegExp(
+      `(?:^|\\n)\\s*(?:[-*]\\s*|\\d+[.)]\\s*|步骤\\s*\\d+\\s*[:：]\\s*)?` +
+      `(?:Use\\s+)?Bash\\s*(?:tool|工具)?[^\\n。；;]{0,80}?` +
+      `(?:execute|run|exec|执行|运行)\\s*[:：]?\\s*([^\\n。；;]{1,500})`,
+      'gi',
+    );
+    while ((m = bashToolRe.exec(planText)) !== null) {
+      if (lineLooksAlreadyDone(lineAt(m.index))) continue;
+      const command = normalizeNarrativeValue('command', cleanPlanValue(m[1]));
+      if (!command || !shellCommandLooksConcrete(command)) continue;
+      add(m.index, {
         name: bashName,
         argumentsJson: JSON.stringify({ command }),
         layer: 'narrative',
@@ -404,13 +477,61 @@ function extractClaudeCodePlanLines(text, names) {
       /(?:Edit\s*(?:工具)?|使用\s*Edit\s*(?:工具)?|调用\s*Edit\s*(?:工具)?)[^\n。；;]{0,80}?file_path\s*[:=]\s*([A-Za-z0-9_./-]+)[,\s，]+old_string\s*[:=]\s*["'`「『]?([^"'`「」『』\s，,。；;]+)["'`」』]?[,\s，]+new_string\s*[:=]\s*["'`「『]?([^"'`「」『』\s，,。；;]+)["'`」』]?/gi,
       /(?:把|将)\s*([A-Za-z0-9_./-]+)\s*(?:中|中的|里|里的|内|内的)\s*["'`「『]?([^"'`「」『』\s，。；;]+)["'`」』]?\s*(?:修改为|改为|替换为|变成|=>|->|为)\s*["'`「『]?([^"'`「」『』\s，。；;]+)["'`」』]?/gi,
       /(?:Edit\s*(?:工具)?|使用\s*Edit\s*(?:工具)?|调用\s*Edit\s*(?:工具)?)[^\n。；;]{0,80}?\s*([A-Za-z0-9_./-]+)\s*(?:中|中的|里|里的|内|内的)\s*["'`「『]?([^"'`「」『』\s，。；;]+)["'`」』]?\s*(?:修改为|改为|替换为|变成|=>|->|为)\s*["'`「『]?([^"'`「」『』\s，。；;]+)["'`」』]?/gi,
+      /(?:Edit\s*(?:工具|tool)?|使用\s*Edit\s*(?:工具)?|调用\s*Edit\s*(?:工具)?)[^\n。；;]{0,80}?(?:把|将)\s*([A-Za-z0-9_./-]+)\s*(?:中|中的|里|里的|内|内的)\s*(?:唯一(?:的)?\s*)?["'`「『]?([^"'`「」『』\s，。；;]+)["'`」』]?\s*(?:修改为|改为|改成|替换为|变成|=>|->|为)\s*["'`「『]?([^"'`「」『』\s，。；;]+)["'`」』]?/gi,
     ];
     for (const editRe of editPatterns) {
       let m;
       while ((m = editRe.exec(planText)) !== null) {
-        out.push({
+        if (lineLooksAlreadyDone(lineAt(m.index))) continue;
+        add(m.index, {
           name: editName,
-          argumentsJson: JSON.stringify({ file_path: m[1].trim(), old_string: m[2].trim(), new_string: m[3].trim() }),
+          argumentsJson: JSON.stringify({ file_path: normalizeNarrativeValue('file_path', cleanPlanValue(m[1])), old_string: cleanPlanValue(m[2]), new_string: cleanPlanValue(m[3]) }),
+          layer: 'narrative',
+          confidence: 0.65,
+        });
+      }
+    }
+    const englishEditPatterns = [
+      new RegExp(`(?:Edit\\s*(?:tool)?|Use\\s+Edit\\s*(?:tool)?)[^\\n。；;]{0,80}?(?:change|replace)[^\\n。；;]{0,80}?${quotedValue}\\s+(?:in|inside|within)\\s+${filePath}\\s+(?:to|with)\\s+${quotedValue}`, 'gi'),
+      new RegExp(`(?:Edit\\s*(?:tool)?|Use\\s+Edit\\s*(?:tool)?)[^\\n。；;]{0,80}?(?:replace|change)[^\\n。；;]{0,80}?${quotedValue}\\s+(?:with|to)\\s+${quotedValue}\\s+(?:in|inside|within)\\s+${filePath}`, 'gi'),
+    ];
+    let m;
+    while ((m = englishEditPatterns[0].exec(planText)) !== null) {
+      if (lineLooksAlreadyDone(lineAt(m.index))) continue;
+      add(m.index, {
+        name: editName,
+        argumentsJson: JSON.stringify({ file_path: normalizeNarrativeValue('file_path', cleanPlanValue(m[2])), old_string: cleanPlanValue(m[1]), new_string: cleanPlanValue(m[3]) }),
+        layer: 'narrative',
+        confidence: 0.65,
+      });
+    }
+    while ((m = englishEditPatterns[1].exec(planText)) !== null) {
+      if (lineLooksAlreadyDone(lineAt(m.index))) continue;
+      add(m.index, {
+        name: editName,
+        argumentsJson: JSON.stringify({ file_path: normalizeNarrativeValue('file_path', cleanPlanValue(m[3])), old_string: cleanPlanValue(m[1]), new_string: cleanPlanValue(m[2]) }),
+        layer: 'narrative',
+        confidence: 0.65,
+      });
+    }
+  }
+
+  const writeName = preferredName(names, ['Write']);
+  if (writeName) {
+    const writePatterns = [
+      new RegExp(`(?:Write\\s*(?:工具|tool)?|使用\\s*Write\\s*(?:工具)?|调用\\s*Write\\s*(?:工具)?)[^\\n。；;]{0,80}?file_path\\s*[:=]\\s*${filePath}[^\\n。；;]{0,120}?(?:content|内容)\\s*[:=]\\s*${quotedValue}`, 'gi'),
+      new RegExp(`(?:Write\\s*(?:工具|tool)?|使用\\s*Write\\s*(?:工具)?|调用\\s*Write\\s*(?:工具)?)[^\\n。；;]{0,80}?(?:create|write|生成|创建|新建|写入)[^\\n。；;]{0,80}?${filePath}[^\\n。；;]{0,120}?(?:content|内容)(?:\\s*(?:must\\s+be|is|为|是|写(?:为)?|包含))?\\s*[:：]?\\s*${quotedValue}`, 'gi'),
+      new RegExp(`(?:创建|新建|生成|写入)[^\\n。；;]{0,60}?${filePath}[^\\n。；;]{0,120}?(?:内容)(?:\\s*(?:为|是|写(?:为)?|包含))?\\s*[:：]?\\s*${quotedValue}`, 'gi'),
+      new RegExp(`(?:Write\\s*(?:工具|tool)?|使用\\s*Write\\s*(?:工具)?|调用\\s*Write\\s*(?:工具)?)[^\\n。；;]{0,80}?(?:create|write|生成|创建|新建|写入)[^\\n。；;]{0,80}?${filePath}[^\\n。；;]{0,120}?(?:content|内容)(?:\\s*(?:must\\s+be|is|为|是|写(?:为)?|包含|只写一行))?\\s*[:：]?\\s*([^\\n。；;，,]{1,500})`, 'gi'),
+      new RegExp(`(?:创建|新建|生成|写入)[^\\n。；;]{0,60}?${filePath}[^\\n。；;]{0,120}?(?:内容)(?:\\s*(?:为|是|写(?:为)?|包含|只写一行))?\\s*[:：]?\\s*([^\\n。；;，,]{1,500})`, 'gi'),
+    ];
+    for (const writeRe of writePatterns) {
+      let m;
+      while ((m = writeRe.exec(planText)) !== null) {
+        if (lineLooksAlreadyDone(lineAt(m.index))) continue;
+        add(m.index, {
+          name: writeName,
+          argumentsJson: JSON.stringify({ file_path: normalizeNarrativeValue('file_path', cleanPlanValue(m[1])), content: cleanContentValue(m[2]) }),
           layer: 'narrative',
           confidence: 0.65,
         });
@@ -423,17 +544,34 @@ function extractClaudeCodePlanLines(text, names) {
     const readRe = /(?:Read\s*(?:工具)?|使用\s*Read\s*(?:工具)?|调用\s*Read\s*(?:工具)?|读取)\s*(?:file_path\s*[:=]\s*)?([A-Za-z0-9_./-]+\.[A-Za-z0-9_-]+)(?:\s*(?:和|,|，|and)\s*(?:file_path\s*[:=]\s*)?([A-Za-z0-9_./-]+\.[A-Za-z0-9_-]+))?/gi;
     let m;
     while ((m = readRe.exec(planText)) !== null) {
+      if (lineLooksAlreadyDone(lineAt(m.index))) continue;
       for (const filePath of [m[1], m[2]].filter(Boolean)) {
-        out.push({
+        add(m.index, {
           name: readName,
-          argumentsJson: JSON.stringify({ file_path: filePath.trim() }),
+          argumentsJson: JSON.stringify({ file_path: normalizeNarrativeValue('file_path', cleanPlanValue(filePath)) }),
           layer: 'narrative',
           confidence: 0.65,
         });
       }
     }
+    const englishReadRe = new RegExp(
+      `(?:^|\\n)\\s*(?:[-*]\\s*|\\d+[.)]\\s*|步骤\\s*\\d+\\s*[:：]\\s*)?` +
+      `(?:Use\\s+)?Read\\s*(?:tool|工具)?\\s*(?:to\\s+)?read\\s+${filePath}`,
+      'gi',
+    );
+    while ((m = englishReadRe.exec(planText)) !== null) {
+      if (lineLooksAlreadyDone(lineAt(m.index))) continue;
+      add(m.index, {
+        name: readName,
+        argumentsJson: JSON.stringify({ file_path: normalizeNarrativeValue('file_path', cleanPlanValue(m[1])) }),
+        layer: 'narrative',
+        confidence: 0.65,
+      });
+    }
   }
-  return out;
+  return out
+    .sort((a, b) => a._pos - b._pos)
+    .map(({ _pos, ...tc }) => tc);
 }
 
 /**

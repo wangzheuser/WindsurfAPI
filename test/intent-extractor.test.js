@@ -25,6 +25,7 @@ const fnTool = (name, props = { command: 'string' }, required = ['command']) => 
 const SHELL_TOOL = fnTool('shell_exec');
 const BASH_TOOL = fnTool('Bash');
 const READ_TOOL = fnTool('Read', { file_path: 'string' }, ['file_path']);
+const WRITE_TOOL = fnTool('Write', { file_path: 'string', content: 'string' }, ['file_path', 'content']);
 const ACTIONABLE = { lastUserText: 'run shell_exec to echo something' };
 
 describe('Layer 1 — explicit invocation syntax', () => {
@@ -227,6 +228,65 @@ describe('Layer 3 — natural narrative (live GLM-4.7 reproducer)', () => {
       ['Edit', { file_path: 'edit-target.txt', old_string: 'before-edit', new_string: 'after-edit' }],
       ['Read', { file_path: 'generated.txt' }],
       ['Read', { file_path: 'edit-target.txt' }],
+    ]);
+  });
+
+  it('recovers Claude Code core-tool English plan in source order', () => {
+    const editTool = fnTool(
+      'Edit',
+      { file_path: 'string', old_string: 'string', new_string: 'string' },
+      ['file_path', 'old_string', 'new_string'],
+    );
+    const text = `The user wants me to perform a sequence of tool operations in order:
+
+1. Use Read tool to read read-target.txt
+2. Use Edit tool to change the unique "before-edit" in edit-target.txt to "after-edit"
+3. Use Write tool to create generated.txt with content "created-by-write-tool"
+4. Use Bash tool to execute: printf 'bash-ok'
+5. Use Read or Bash to confirm generated.txt and edit-target.txt content`;
+    const r = extractIntentFromNarrative(
+      text,
+      [READ_TOOL, editTool, WRITE_TOOL, BASH_TOOL],
+      { lastUserText: 'Use Read, Edit, Write, Bash tools to create and edit files' },
+    );
+    assert.deepEqual(r.map(x => [x.name, JSON.parse(x.argumentsJson)]), [
+      ['Read', { file_path: 'read-target.txt' }],
+      ['Edit', { file_path: 'edit-target.txt', old_string: 'before-edit', new_string: 'after-edit' }],
+      ['Write', { file_path: 'generated.txt', content: 'created-by-write-tool' }],
+      ['Bash', { command: "printf 'bash-ok'" }],
+    ]);
+  });
+
+  it('recovers Write from Claude Code thinking narration', () => {
+    const r = extractIntentFromNarrative(
+      '用户要求我使用 Write 工具创建一个名为 generated.txt 的文件，内容为 "write-tool-ok"。让我执行这个任务。',
+      [WRITE_TOOL],
+      { lastUserText: 'Use the Write tool to create generated.txt with exactly: write-tool-ok' },
+    );
+    assert.deepEqual(r.map(x => [x.name, JSON.parse(x.argumentsJson)]), [
+      ['Write', { file_path: 'generated.txt', content: 'write-tool-ok' }],
+    ]);
+  });
+
+  it('recovers Chinese Claude Code core-tool plan and skips completed steps', () => {
+    const editTool = fnTool(
+      'Edit',
+      { file_path: 'string', old_string: 'string', new_string: 'string' },
+      ['file_path', 'old_string', 'new_string'],
+    );
+    const text = `用户要求我按顺序完成以下任务：
+1. 使用 Read 工具读取 read-target.txt - 已完成，内容是 "read-ok"
+2. 使用 Edit 工具把 edit-target.txt 中唯一的 before-edit 改成 after-edit - 需要执行
+3. 使用 Write 工具新建 generated.txt，内容只写一行：created-by-write-tool - 需要执行
+4. 使用 Bash 工具执行：printf 'bash-ok' - 已完成，输出是 bash-ok`;
+    const r = extractIntentFromNarrative(
+      text,
+      [READ_TOOL, editTool, WRITE_TOOL, BASH_TOOL],
+      { lastUserText: '使用 Read、Edit、Write、Bash 工具创建和编辑文件' },
+    );
+    assert.deepEqual(r.map(x => [x.name, JSON.parse(x.argumentsJson)]), [
+      ['Edit', { file_path: 'edit-target.txt', old_string: 'before-edit', new_string: 'after-edit' }],
+      ['Write', { file_path: 'generated.txt', content: 'created-by-write-tool' }],
     ]);
   });
 

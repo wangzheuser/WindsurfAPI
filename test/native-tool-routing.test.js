@@ -110,6 +110,55 @@ function parseChatFrames(raw) {
     });
 }
 
+function coreClaudeCodeTools() {
+  return [
+    {
+      type: 'function',
+      function: {
+        name: 'Read',
+        description: 'Read file',
+        parameters: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] },
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'Edit',
+        description: 'Edit file',
+        parameters: {
+          type: 'object',
+          properties: {
+            file_path: { type: 'string' },
+            old_string: { type: 'string' },
+            new_string: { type: 'string' },
+          },
+          required: ['file_path', 'old_string', 'new_string'],
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'Write',
+        description: 'Write file',
+        parameters: {
+          type: 'object',
+          properties: { file_path: { type: 'string' }, content: { type: 'string' } },
+          required: ['file_path', 'content'],
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'Bash',
+        description: 'Run shell command',
+        parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] },
+      },
+    },
+  ];
+}
+
 describe('stream tool emulation', () => {
   it('recovers Claude Code thinking-only Bash narration into streamed tool_calls', async () => {
     delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE;
@@ -166,6 +215,166 @@ describe('stream tool emulation', () => {
     assert.equal(toolDeltas[0].function.arguments, '{"command":"printf \\"TOOLCALL_OK\\\\n\\""}');
     const finish = frames.flatMap(f => f.choices || []).find(c => c.finish_reason);
     assert.equal(finish.finish_reason, 'tool_calls');
+  });
+
+  it('recovers Claude Code thinking-only Read/Edit/Write/Bash plan into streamed tool_calls', async () => {
+    delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE;
+    delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_OFF;
+    const account = addAccountByKey(`stream-core-nlu-${Date.now()}-${Math.random().toString(36).slice(2)}`, 'stream-core-nlu');
+    createdAccountIds.push(account.id);
+    const tools = coreClaudeCodeTools();
+
+    class FakeClient {
+      async cascadeChat(_messages, _modelEnum, _modelUid, opts) {
+        assert.equal(opts.nativeMode, false);
+        opts.onChunk({
+          thinking: `The user wants me to perform a sequence of tool operations in order:
+
+1. Use Read tool to read read-target.txt
+2. Use Edit tool to change the unique "before-edit" in edit-target.txt to "after-edit"
+3. Use Write tool to create generated.txt with content "created-by-write-tool"
+4. Use Bash tool to execute: printf 'bash-ok'
+5. Use Read or Bash to confirm generated.txt and edit-target.txt content`,
+        });
+        return { cascadeId: 'stream-core-nlu-cascade', sessionId: 'stream-core-nlu-session', toolCalls: [] };
+      }
+    }
+
+    const result = await handleChatCompletions({
+      model: 'claude-sonnet-4.6',
+      stream: true,
+      __route: 'messages',
+      messages: [{ role: 'user', content: 'Use Read, Edit, Write and Bash tools to create and edit files.' }],
+      tools,
+    }, {
+      waitForAccount(tried, _signal, _maxWaitMs, modelKey) {
+        return tried.length === 0 ? getApiKey(tried, modelKey) : null;
+      },
+      ensureLs: async () => {},
+      getLsFor: () => ({ port: 17777, csrfToken: 'csrf', generation: 1 }),
+      WindsurfClient: FakeClient,
+    });
+
+    assert.equal(result.status, 200);
+    const res = fakeRes();
+    await result.handler(res);
+    const frames = parseChatFrames(res.body).filter(f => f !== '[DONE]');
+    const toolDeltas = frames.flatMap(f => f.choices || [])
+      .map(c => c.delta?.tool_calls?.[0])
+      .filter(Boolean);
+    assert.deepEqual(toolDeltas.map(t => t.function.name), ['Read', 'Edit', 'Write', 'Bash']);
+    assert.deepEqual(toolDeltas.map(t => JSON.parse(t.function.arguments)), [
+      { file_path: 'read-target.txt' },
+      { file_path: 'edit-target.txt', old_string: 'before-edit', new_string: 'after-edit' },
+      { file_path: 'generated.txt', content: 'created-by-write-tool' },
+      { command: "printf 'bash-ok'" },
+    ]);
+    const finish = frames.flatMap(f => f.choices || []).find(c => c.finish_reason);
+    assert.equal(finish.finish_reason, 'tool_calls');
+  });
+
+  it('recovers concrete tool plan from thinking when visible text is generic', async () => {
+    delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE;
+    delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_OFF;
+    const account = addAccountByKey(`stream-mixed-nlu-${Date.now()}-${Math.random().toString(36).slice(2)}`, 'stream-mixed-nlu');
+    createdAccountIds.push(account.id);
+    const tools = coreClaudeCodeTools();
+
+    class FakeClient {
+      async cascadeChat(_messages, _modelEnum, _modelUid, opts) {
+        assert.equal(opts.nativeMode, false);
+        opts.onChunk({
+          thinking: `用户要求我按顺序执行4个动作：
+1. 使用 Read 工具读取 read-target.txt
+2. 使用 Edit 工具把 edit-target.txt 中唯一的 before-edit 改成 after-edit
+3. 使用 Write 工具新建 generated.txt，内容只写一行：created-by-write-tool
+4. 使用 Bash 工具执行：printf 'bash-ok'`,
+          text: '我将按顺序执行这4个动作。首先读取两个目标文件。',
+        });
+        return { cascadeId: 'stream-mixed-nlu-cascade', sessionId: 'stream-mixed-nlu-session', toolCalls: [] };
+      }
+    }
+
+    const result = await handleChatCompletions({
+      model: 'claude-sonnet-4.6',
+      stream: true,
+      __route: 'messages',
+      messages: [{ role: 'user', content: 'Use Read, Edit, Write and Bash tools to create and edit files.' }],
+      tools,
+    }, {
+      waitForAccount(tried, _signal, _maxWaitMs, modelKey) {
+        return tried.length === 0 ? getApiKey(tried, modelKey) : null;
+      },
+      ensureLs: async () => {},
+      getLsFor: () => ({ port: 17777, csrfToken: 'csrf', generation: 1 }),
+      WindsurfClient: FakeClient,
+    });
+
+    assert.equal(result.status, 200);
+    const res = fakeRes();
+    await result.handler(res);
+    const frames = parseChatFrames(res.body).filter(f => f !== '[DONE]');
+    const toolDeltas = frames.flatMap(f => f.choices || [])
+      .map(c => c.delta?.tool_calls?.[0])
+      .filter(Boolean);
+    assert.deepEqual(toolDeltas.map(t => t.function.name), ['Read', 'Edit', 'Write', 'Bash']);
+    assert.deepEqual(toolDeltas.map(t => JSON.parse(t.function.arguments)), [
+      { file_path: 'read-target.txt' },
+      { file_path: 'edit-target.txt', old_string: 'before-edit', new_string: 'after-edit' },
+      { file_path: 'generated.txt', content: 'created-by-write-tool' },
+      { command: "printf 'bash-ok'" },
+    ]);
+  });
+
+  it('does not restart tools from thinking after a terminal visible answer', async () => {
+    delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE;
+    delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_OFF;
+    const account = addAccountByKey(`stream-terminal-nlu-${Date.now()}-${Math.random().toString(36).slice(2)}`, 'stream-terminal-nlu');
+    createdAccountIds.push(account.id);
+    const tools = coreClaudeCodeTools();
+
+    class FakeClient {
+      async cascadeChat(_messages, _modelEnum, _modelUid, opts) {
+        assert.equal(opts.nativeMode, false);
+        opts.onChunk({
+          text: 'TOOL_SEQUENCE_OK',
+          thinking: `用户要求我按顺序完成4个动作：
+1. 使用 Read 工具读取 read-target.txt - 已完成
+2. 使用 Edit 工具把 edit-target.txt 中唯一的 before-edit 改成 after-edit - 已完成
+3. 使用 Write 工具新建 generated.txt，内容只写一行：created-by-write-tool - 已完成
+4. 使用 Bash 工具执行：printf 'bash-ok' - 已完成`,
+        });
+        return { cascadeId: 'stream-terminal-nlu-cascade', sessionId: 'stream-terminal-nlu-session', toolCalls: [] };
+      }
+    }
+
+    const result = await handleChatCompletions({
+      model: 'claude-sonnet-4.6',
+      stream: true,
+      __route: 'messages',
+      messages: [{ role: 'user', content: 'Use Read, Edit, Write and Bash tools to create and edit files.' }],
+      tools,
+    }, {
+      waitForAccount(tried, _signal, _maxWaitMs, modelKey) {
+        return tried.length === 0 ? getApiKey(tried, modelKey) : null;
+      },
+      ensureLs: async () => {},
+      getLsFor: () => ({ port: 17777, csrfToken: 'csrf', generation: 1 }),
+      WindsurfClient: FakeClient,
+    });
+
+    assert.equal(result.status, 200);
+    const res = fakeRes();
+    await result.handler(res);
+    const frames = parseChatFrames(res.body).filter(f => f !== '[DONE]');
+    const toolDeltas = frames.flatMap(f => f.choices || [])
+      .map(c => c.delta?.tool_calls?.[0])
+      .filter(Boolean);
+    assert.deepEqual(toolDeltas, []);
+    const text = frames.flatMap(f => f.choices || []).map(c => c.delta?.content || '').join('');
+    assert.equal(text, 'TOOL_SEQUENCE_OK');
+    const finish = frames.flatMap(f => f.choices || []).find(c => c.finish_reason);
+    assert.equal(finish.finish_reason, 'stop');
   });
 });
 

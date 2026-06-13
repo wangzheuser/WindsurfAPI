@@ -777,6 +777,43 @@ function recentUserText(messages) {
   return '';
 }
 
+/**
+ * Build a single NLU source from visible text and model thinking.
+ */
+function combinedNarrativeSource(...parts) {
+  const out = [];
+  const seen = new Set();
+  for (const part of parts) {
+    const value = String(part || '').trim();
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    out.push(value);
+  }
+  return out.join('\n\n');
+}
+
+/**
+ * Detect a visible final answer so hidden/historical thinking does not restart tools.
+ */
+function looksLikeTerminalVisibleText(text) {
+  const s = String(text || '').trim();
+  if (!s) return false;
+  const compact = s.replace(/\s+/g, '');
+  if (/^(?:TOOL_[A-Z0-9_]*OK|[A-Z0-9_]+_OK|DONE|OK)$/i.test(compact)) return true;
+  if (/^(?:完成|已完成|全部完成|任务已完成|Done\.?|All done\.?|Completed\.?)$/i.test(s)) return true;
+  if (/^(?:所有|全部).{0,20}(?:完成|正确)/.test(s) && !/(使用|调用|执行|读取|修改|写入|use|call|run|read|edit|write)/i.test(s)) return true;
+  return false;
+}
+
+/**
+ * Build NLU source while avoiding tool loops after a final visible answer.
+ */
+function nluNarrativeSource(visibleText, thinkingText) {
+  const visible = String(visibleText || '').trim();
+  if (looksLikeTerminalVisibleText(visible)) return visible;
+  return combinedNarrativeSource(visible, thinkingText);
+}
+
 function shellUnquote(text) {
   const s = String(text || '').trim();
   if (s.length >= 2 && ((s[0] === '"' && s.at(-1) === '"') || (s[0] === '\'' && s.at(-1) === '\''))) {
@@ -2670,11 +2707,10 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
         // v2.0.72 fix: GLM-4.7 / GLM-5.1 sometimes emit narration in
         // CortexStepPlannerResponse.thinking instead of .response, so
         // allText is empty while allThinking carries the actual model
-        // output. Combine both for marker detection / NLU recovery so
-        // we see narrate-style tool intents either way. Promotion to
-        // allText (line ~2155 below) happens after this; we use the
-        // combined source proactively.
-        const narrativeSource = (allText && allText.trim()) ? allText : allThinking;
+        // output. Use both visible text and thinking for marker detection /
+        // NLU recovery: Claude Code may put the concrete tool plan in
+        // thinking while the visible text only says "I'll start now".
+        const narrativeSource = nluNarrativeSource(allText, allThinking);
         if (toolCalls.length === 0 && narrativeSource) {
           const markers = [];
           if (/<tool_call/i.test(narrativeSource)) markers.push('xml_tag');
@@ -3657,7 +3693,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
               // accThinking for marker / NLU detection so models that
               // route narrate output through reasoning_content (GLM-4.7,
               // some Claude models in thinking mode) don't slip past.
-              const accNarrative = (accText && accText.trim()) ? accText : accThinking;
+              const accNarrative = nluNarrativeSource(accText, accThinking);
               if (emulateTools && collectedToolCalls.length === 0 && accNarrative) {
                 const head = accNarrative.slice(0, 240).replace(/\s+/g, ' ');
                 const markers = [];
